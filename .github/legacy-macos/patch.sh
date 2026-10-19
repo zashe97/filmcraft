@@ -52,6 +52,36 @@ if [ "$changed" = 1 ]; then
   cargo metadata --format-version 1 >/dev/null # adds webpki-roots to Cargo.lock, changing nothing else
 fi
 
+# 2c. FilmCraft: VideoToolbox's hardware decode query (VTIsHardwareDecodeSupported), HEVC calls and
+# some encoder keys are macOS 10.13+; on Sierra they are NULL and touching them crashes. Below 10.13
+# report no hardware codec, so decoding and export fall back to FilmCraft's own Rust codecs.
+VT=crates/platform/src/videotoolbox.rs
+VTE=crates/platform/src/videotoolbox_encode.rs
+if [ -f "$VT" ] && grep -q 'pub fn hardware_available(codec: NalCodec) -> bool {' "$VT"; then
+  perl -0pi -e 's#(pub fn hardware_available\(codec: NalCodec\) -> bool \{\n)#${1}    if !macos_at_least_10_13() {\n        return false;\n    }\n#' "$VT"
+  cat >> "$VT" <<'RS'
+
+/// Whether this Mac runs macOS 10.13 or later, where VideoToolbox has the calls this module uses
+/// (macOS 10.12 build patch). Read once from SystemVersion.plist; unreadable counts as older.
+pub(crate) fn macos_at_least_10_13() -> bool {
+    static AT_LEAST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AT_LEAST.get_or_init(|| {
+        let Ok(plist) = std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist") else { return false };
+        let Some(after) = plist.split("<key>ProductVersion</key>").nth(1) else { return false };
+        let Some(version) = after.split("<string>").nth(1).and_then(|v| v.split("</string>").next()) else { return false };
+        let mut parts = version.trim().split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+        let (major, minor) = (parts.next().unwrap_or(0), parts.next().unwrap_or(0));
+        major > 10 || (major == 10 && minor >= 13)
+    })
+}
+RS
+  grep -q 'if !macos_at_least_10_13()' "$VT"
+  if [ -f "$VTE" ]; then
+    perl -0pi -e 's#(pub fn new\(config: VtConfig\) -> Result<VtEncoder, String> \{\n)#${1}        if !crate::videotoolbox::macos_at_least_10_13() {\n            return Err("hardware encoding needs macOS 10.13".into());\n        }\n#' "$VTE"
+    grep -q 'hardware encoding needs macOS 10.13' "$VTE"
+  fi
+fi
+
 # 3. Upstream fixes needed until they land upstream (each applies only while the bug is there).
 # craft-launcher #461 added a `replace` argument to install_dmg but missed the macOS self-update call.
 if [ -f crates/native/src/self_update.rs ]; then
