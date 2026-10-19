@@ -39,9 +39,16 @@ if [ -f crates/core/src/catalog.rs ] && grep -q 'LAUNCHER_REPO' crates/core/src/
 fi
 # 2b. HTTPS: the OS certificate verifier needs SecTrustEvaluateWithError (10.14+) and Sierra's root
 # store is years out of date, so verify against the bundled Mozilla roots (webpki-roots) instead.
-if [ -f crates/native/src/http.rs ] && grep -q 'RootCerts::PlatformVerifier' crates/native/src/http.rs; then
-  perl -pi -e 's#"platform-verifier"#"rustls-webpki-roots"#' crates/native/Cargo.toml
-  perl -pi -e 's#RootCerts::PlatformVerifier#RootCerts::WebPki#g' crates/native/src/http.rs
+# Applies to every crate that uses ureq's platform verifier (the launcher, FilmCraft's speech models…).
+changed=0
+while IFS= read -r rs; do
+  perl -pi -e 's#RootCerts::PlatformVerifier#RootCerts::WebPki#g' "$rs"
+  changed=1
+done < <(grep -rl --include='*.rs' 'RootCerts::PlatformVerifier' crates apps 2>/dev/null || true)
+if [ "$changed" = 1 ]; then
+  while IFS= read -r toml; do
+    perl -pi -e 's#"platform-verifier"#"rustls-webpki-roots"#' "$toml"
+  done < <(grep -rlE --include=Cargo.toml '^ureq *=.*"platform-verifier"' crates apps 2>/dev/null || true)
   cargo metadata --format-version 1 >/dev/null # adds webpki-roots to Cargo.lock, changing nothing else
 fi
 
