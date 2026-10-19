@@ -1,0 +1,171 @@
+# Builds this Craft App for macOS 10.12 Sierra (Intel) and publishes it as a GitHub release
+# of this fork, where the patched launcher finds it. See .github/legacy-macos/patch.sh.
+# It builds the latest upstream release (storytold/<this repo>) with this fork's build scripts:
+# - every day, if that release isn't built here yet, so the launcher offers the update on its own;
+# - by hand (Actions > macOS 10.12 build > Run workflow), "force" rebuilds a release already built;
+# - on a push to main (the build scripts changed), always.
+name: macOS 10.12 build
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if the latest release is already built
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+  schedule:
+    - cron: '23 4 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+      tag: ${{ steps.decide.outputs.tag }}
+      fork_version: ${{ steps.decide.outputs.fork_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ github.event_name == 'push' || inputs.force == true }}
+        run: |
+          set -euo pipefail
+          # GitHub turns scheduled workflows off after 60 days without commits; re-enabling keeps it on.
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/macos-legacy.yml/enable" || true
+          upstream="https://github.com/storytold/${GITHUB_REPOSITORY#*/}.git"
+          tag=$(git ls-remote --tags --refs "$upstream" | awk -F/ '{print $NF}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)
+          if [ -z "$tag" ]; then echo "::error::No release found in $upstream"; exit 1; fi
+          version=$(bash .github/legacy-macos/fork_version.sh "${GITHUB_REPOSITORY#*/}" "${tag#v}")
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "fork_version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != true ] && gh api "repos/$GITHUB_REPOSITORY/releases/tags/v$version" >/dev/null 2>&1; then
+            echo "::notice::v$version (storytold $tag) is already built, nothing to do"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Building storytold $tag as v$version"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    concurrency:
+      group: macos-legacy
+      cancel-in-progress: false
+    env:
+      UPSTREAM_TAG: ${{ needs.check.outputs.tag }}
+      LEGACY_VERSION: ${{ needs.check.outputs.fork_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Switch to the upstream release
+        run: |
+          set -euo pipefail
+          # Keep this fork's build scripts, take everything else from the upstream release.
+          cp -R .github/legacy-macos "$RUNNER_TEMP/legacy-macos"
+          git fetch --depth=1 "https://github.com/storytold/${GITHUB_REPOSITORY#*/}.git" "refs/tags/$UPSTREAM_TAG:refs/tags/upstream-$UPSTREAM_TAG"
+          git checkout -f "upstream-$UPSTREAM_TAG"
+          git clean -fdx
+          mkdir -p .github
+          rm -rf .github/legacy-macos
+          cp -R "$RUNNER_TEMP/legacy-macos" .github/legacy-macos
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-legacy-x86_64
+      - name: Patch for macOS 10.12
+        run: bash .github/legacy-macos/patch.sh "${GITHUB_REPOSITORY_OWNER}"
+      - name: Build and package (x86_64, ad-hoc signed)
+        env:
+          # Weak-link Apple's frameworks: a symbol newer than 10.12 (e.g. NSAboutPanelOptionApplicationIcon,
+          # 10.13) is then NULL on Sierra instead of stopping the app at launch.
+          CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS: >-
+            -C link-arg=-Wl,-weak_framework,AppKit -C link-arg=-Wl,-weak_framework,Foundation
+            -C link-arg=-Wl,-weak_framework,CoreFoundation -C link-arg=-Wl,-weak_framework,CoreGraphics
+            -C link-arg=-Wl,-weak_framework,CoreText -C link-arg=-Wl,-weak_framework,QuartzCore
+            -C link-arg=-Wl,-weak_framework,Metal -C link-arg=-Wl,-weak_framework,CoreVideo
+            -C link-arg=-Wl,-weak_framework,CoreMedia -C link-arg=-Wl,-weak_framework,VideoToolbox
+            -C link-arg=-Wl,-weak_framework,AVFoundation -C link-arg=-Wl,-weak_framework,AudioToolbox
+            -C link-arg=-Wl,-weak_framework,CoreAudio -C link-arg=-Wl,-weak_framework,IOKit
+            -C link-arg=-Wl,-weak_framework,Security -C link-arg=-Wl,-weak_framework,SystemConfiguration
+            -C link-arg=-Wl,-weak_framework,CoreServices -C link-arg=-Wl,-weak_framework,ApplicationServices
+            -C link-arg=-Wl,-weak_framework,Carbon
+        run: |
+          unset MACOS_SIGN_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          set -o pipefail
+          if ! bash packaging/macos/package.sh --arch x86_64 2>&1 | tee build.log; then
+            # Surface the errors as annotations, readable without downloading the full log.
+            grep -E -A12 '^(error|ld: |clang: error|Undefined symbols)' build.log | head -c 60000 > errors.txt || true
+            [ -s errors.txt ] || tail -n 80 build.log > errors.txt
+            echo "::error title=Build failed::$(sed -e 's/%/%25/g' errors.txt | awk 'BEGIN{ORS="%0A"} {print}')"
+            exit 1
+          fi
+      - name: Check the binaries target 10.12
+        run: |
+          set -euo pipefail
+          ls -la dist/release
+          # Frameworks that don't exist on 10.12: linking any of them would stop the app at launch.
+          NEWER='UniformTypeIdentifiers|UserNotifications|ScreenCaptureKit|Vision|CoreML|Network\.framework|NaturalLanguage|CryptoKit|Combine|SwiftUI|libswift|MetalPerformanceShadersGraph|AppTrackingTransparency|LinkPresentation'
+          fail=0
+          for app in target/macos-package/*.app; do
+            for bin in "$app"/Contents/MacOS/*; do
+              echo "== $bin"
+              otool -l "$bin" | grep -A4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX' | grep -E 'minos|version' || true
+              # Below 10.14 the linker writes LC_VERSION_MIN_MACOSX ("version"), above LC_BUILD_VERSION ("minos").
+              minos=$(otool -l "$bin" | awk '/LC_VERSION_MIN_MACOSX|LC_BUILD_VERSION/ {f=1} f && ($1=="minos" || $1=="version") {print $2; exit}')
+              echo "minos: ${minos:-unknown}"
+              if [ "$minos" != "10.12" ]; then echo "::error::$bin has minos $minos"; fail=1; fi
+              otool -L "$bin" | tail -n +2
+              if otool -L "$bin" | grep -E "$NEWER" | grep -v '(weak)' ; then
+                echo "::error::$bin links a framework newer than 10.12"; fail=1
+              fi
+            done
+          done
+          # Every imported symbol, checked against the macOS 10.12 SDK's symbol lists.
+          curl -sSfL -o sdk.tar.xz https://github.com/phracker/MacOSX-SDKs/releases/download/11.3/MacOSX10.12.sdk.tar.xz
+          tar xJf sdk.tar.xz
+          bins=(target/macos-package/*.app/Contents/MacOS/*)
+          if ! python3 .github/legacy-macos/missing_symbols.py MacOSX10.12.sdk "${bins[@]}" > missing.txt; then fail=1; fi
+          cat missing.txt
+          if grep -q '^STRONG' missing.txt; then
+            echo "::error title=Symbols missing on 10.12 (app won't start)::$(grep '^STRONG' missing.txt | awk 'BEGIN{ORS="%0A"} {print}')"
+          fi
+          if grep -q '^weak' missing.txt; then
+            echo "::warning title=Symbols missing on 10.12 (NULL there, crash only if used)::$(grep '^weak' missing.txt | awk 'BEGIN{ORS="%0A"} {print}')"
+          fi
+          exit $fail
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          . packaging/env.sh
+          TAG="v$VERSION"
+          cd dist/release
+          shopt -s nullglob
+          files=(./*.dmg ./*.zip)
+          shasum -a 256 "${files[@]}" > SHA256SUMS.txt
+          NOTES="Build for macOS 10.12 Sierra (Intel x86_64) of storytold $UPSTREAM_TAG. Ad-hoc signed: the first time, right-click the app and choose Open."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${files[@]}" ./SHA256SUMS.txt --clobber
+          else
+            # Tag the branch head: a tag on an older commit whose workflow files differ from main's
+            # needs the "workflows" permission, which GITHUB_TOKEN can't have.
+            gh release create "$TAG" "${files[@]}" ./SHA256SUMS.txt --target main --title "$TAG (macOS 10.12)" --notes "$NOTES" --latest
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-10.12-x86_64
+          path: dist/release/
+          if-no-files-found: ignore
